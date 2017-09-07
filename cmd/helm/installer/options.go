@@ -76,6 +76,9 @@ type Options struct {
 	//
 	// Less than or equal to zero means no limit.
 	MaxHistory int
+
+	// DaemonSet indicates that Tiller should be deployed as a DaemonSet
+	DaemonSet bool
 }
 
 func (opts *Options) selectImage() string {

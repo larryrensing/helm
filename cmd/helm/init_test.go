@@ -73,6 +73,41 @@ func TestInitCmd(t *testing.T) {
 	}
 }
 
+func TestInitCmd_daemonset(t *testing.T) {
+	home, err := ioutil.TempDir("", "helm_home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(home)
+
+	var buf bytes.Buffer
+	fc := fake.NewSimpleClientset()
+	cmd := &initCmd{
+		out:        &buf,
+		home:       helmpath.Home(home),
+		kubeClient: fc,
+		namespace:  v1.NamespaceDefault,
+		daemonSet:  true,
+	}
+	if err := cmd.run(); err != nil {
+		t.Errorf("expected error: %v", err)
+	}
+	actions := fc.Actions()
+	if len(actions) != 2 {
+		t.Errorf("Expected 2 actions, got %d", len(actions))
+	}
+	if !actions[0].Matches("create", "daemonsets") {
+		t.Errorf("unexpected action: %v, expected create daemonsets", actions[0])
+	}
+	if !actions[1].Matches("create", "services") {
+		t.Errorf("unexpected action: %v, expected create service", actions[1])
+	}
+	expected := "Tiller (the Helm server-side component) has been installed into your Kubernetes Cluster."
+	if !strings.Contains(buf.String(), expected) {
+		t.Errorf("expected %q, got %q", expected, buf.String())
+	}
+}
+
 func TestInitCmd_exists(t *testing.T) {
 	home, err := ioutil.TempDir("", "helm_home")
 	if err != nil {

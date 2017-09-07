@@ -80,6 +80,7 @@ type initCmd struct {
 	kubeClient     kubernetes.Interface
 	serviceAccount string
 	maxHistory     int
+	daemonSet      bool
 }
 
 func newInitCmd(out io.Writer) *cobra.Command {
@@ -106,6 +107,7 @@ func newInitCmd(out io.Writer) *cobra.Command {
 	f.BoolVarP(&i.clientOnly, "client-only", "c", false, "if set does not install Tiller")
 	f.BoolVar(&i.dryRun, "dry-run", false, "do not install local or remote")
 	f.BoolVar(&i.skipRefresh, "skip-refresh", false, "do not refresh (download) the local repository cache")
+	f.BoolVar(&i.daemonSet, "daemonset", false, "deploy tiller as a DaemonSet")
 
 	f.BoolVar(&tlsEnable, "tiller-tls", false, "install Tiller with TLS enabled")
 	f.BoolVar(&tlsVerify, "tiller-tls-verify", false, "install Tiller with TLS enabled and to verify remote certificates")
@@ -159,6 +161,7 @@ func (i *initCmd) run() error {
 	i.opts.ImageSpec = i.image
 	i.opts.ServiceAccount = i.serviceAccount
 	i.opts.MaxHistory = i.maxHistory
+	i.opts.DaemonSet = i.daemonSet
 
 	if settings.Debug {
 		writeYAMLManifest := func(apiVersion, kind, body string, first, last bool) error {
@@ -189,12 +192,23 @@ func (i *initCmd) run() error {
 		var body string
 		var err error
 
-		// write Deployment manifest
-		if body, err = installer.DeploymentManifest(&i.opts); err != nil {
-			return err
-		}
-		if err := writeYAMLManifest("extensions/v1beta1", "Deployment", body, true, false); err != nil {
-			return err
+		if i.opts.DaemonSet {
+			// write DaemonSet manifest
+			if body, err = installer.DaemonSetManifest(&i.opts); err != nil {
+				return err
+			}
+			if err := writeYAMLManifest("extensions/v1beta1", "DaemonSet", body, true, false); err != nil {
+				return err
+			}
+
+		} else {
+			// write Deployment manifest
+			if body, err = installer.DeploymentManifest(&i.opts); err != nil {
+				return err
+			}
+			if err := writeYAMLManifest("extensions/v1beta1", "Deployment", body, true, false); err != nil {
+				return err
+			}
 		}
 
 		// write Service manifest

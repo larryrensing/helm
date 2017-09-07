@@ -35,8 +35,15 @@ import (
 //
 // Returns an error if the command failed.
 func Install(client kubernetes.Interface, opts *Options) error {
-	if err := createDeployment(client.Extensions(), opts); err != nil {
-		return err
+
+	if opts.DaemonSet {
+		if err := createDaemonSet(client.Extensions(), opts); err != nil {
+			return err
+		}
+	} else {
+		if err := createDeployment(client.Extensions(), opts); err != nil {
+			return err
+		}
 	}
 	if err := createService(client.Core(), opts.Namespace); err != nil {
 		return err
@@ -53,16 +60,22 @@ func Install(client kubernetes.Interface, opts *Options) error {
 //
 // Returns an error if the command failed.
 func Upgrade(client kubernetes.Interface, opts *Options) error {
-	obj, err := client.Extensions().Deployments(opts.Namespace).Get(deploymentName, metav1.GetOptions{})
+	if !isUpgradeable(client, opts) {
+		return fmt.Errorf(`tiller cannot be upgraded between different
+			controller types.  remove tiller and re-install with your
+			provided flags (Tip: see helm reset)`)
+	}
+
+	var err error
+	if opts.DaemonSet {
+		err = upgradeDaemonSet(client, opts)
+	} else {
+		err = upgradeDeployment(client, opts)
+	}
 	if err != nil {
 		return err
 	}
-	obj.Spec.Template.Spec.Containers[0].Image = opts.selectImage()
-	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = opts.pullPolicy()
-	obj.Spec.Template.Spec.ServiceAccountName = opts.ServiceAccount
-	if _, err := client.Extensions().Deployments(opts.Namespace).Update(obj); err != nil {
-		return err
-	}
+
 	// If the service does not exists that would mean we are upgrading from a Tiller version
 	// that didn't deploy the service, so install it.
 	_, err = client.Core().Services(opts.Namespace).Get(serviceName, metav1.GetOptions{})
@@ -72,6 +85,50 @@ func Upgrade(client kubernetes.Interface, opts *Options) error {
 	return err
 }
 
+func upgradeDeployment(client kubernetes.Interface, opts *Options) error {
+	obj, err := client.Extensions().Deployments(opts.Namespace).Get(deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	obj.Spec.Template.Spec.Containers[0].Image = opts.selectImage()
+	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = opts.pullPolicy()
+	obj.Spec.Template.Spec.ServiceAccountName = opts.ServiceAccount
+	if _, err := client.Extensions().Deployments(opts.Namespace).Update(obj); err != nil {
+		return err
+	}
+	return err
+}
+
+func upgradeDaemonSet(client kubernetes.Interface, opts *Options) error {
+	obj, err := client.Extensions().DaemonSets(opts.Namespace).Get(deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	obj.Spec.Template.Spec.Containers[0].Image = opts.selectImage()
+	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = opts.pullPolicy()
+	obj.Spec.Template.Spec.ServiceAccountName = opts.ServiceAccount
+	if _, err := client.Extensions().DaemonSets(opts.Namespace).Update(obj); err != nil {
+		return err
+	}
+	return err
+}
+
+func isUpgradeable(client kubernetes.Interface, opts *Options) bool {
+	upgradable := true
+	if opts.DaemonSet {
+		if obj, _ := client.Extensions().Deployments(opts.Namespace).Get(deploymentName, metav1.GetOptions{}); obj != nil {
+			upgradable = false
+		}
+	} else {
+		if obj, _ := client.Extensions().DaemonSets(opts.Namespace).Get(deploymentName, metav1.GetOptions{}); obj != nil {
+			upgradable = false
+		}
+	}
+	return upgradable
+}
+
 // createDeployment creates the Tiller Deployment resource.
 func createDeployment(client extensionsclient.DeploymentsGetter, opts *Options) error {
 	obj := deployment(opts)
@@ -79,9 +136,20 @@ func createDeployment(client extensionsclient.DeploymentsGetter, opts *Options) 
 	return err
 }
 
+func createDaemonSet(client extensionsclient.DaemonSetsGetter, opts *Options) error {
+	obj := daemonSet(opts)
+	_, err := client.DaemonSets(obj.Namespace).Create(obj)
+	return err
+}
+
 // deployment gets the deployment object that installs Tiller.
 func deployment(opts *Options) *v1beta1.Deployment {
 	return generateDeployment(opts)
+}
+
+// deployment gets the deployment object that installs Tiller.
+func daemonSet(opts *Options) *v1beta1.DaemonSet {
+	return generateDaemonSet(opts)
 }
 
 // createService creates the Tiller service resource
@@ -100,6 +168,14 @@ func service(namespace string) *v1.Service {
 // resource.
 func DeploymentManifest(opts *Options) (string, error) {
 	obj := deployment(opts)
+	buf, err := yaml.Marshal(obj)
+	return string(buf), err
+}
+
+// DaemonSetManifest gets the manifest (as a string) that describes the Tiller DaemonSet
+// resource.
+func DaemonSetManifest(opts *Options) (string, error) {
+	obj := daemonSet(opts)
 	buf, err := yaml.Marshal(obj)
 	return string(buf), err
 }
@@ -126,6 +202,97 @@ func generateDeployment(opts *Options) *v1beta1.Deployment {
 			Labels:    labels,
 		},
 		Spec: v1beta1.DeploymentSpec{
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: v1.PodSpec{
+					ServiceAccountName: opts.ServiceAccount,
+					Containers: []v1.Container{
+						{
+							Name:            "tiller",
+							Image:           opts.selectImage(),
+							ImagePullPolicy: opts.pullPolicy(),
+							Ports: []v1.ContainerPort{
+								{ContainerPort: 44134, Name: "tiller"},
+							},
+							Env: []v1.EnvVar{
+								{Name: "TILLER_NAMESPACE", Value: opts.Namespace},
+								{Name: "TILLER_HISTORY_MAX", Value: fmt.Sprintf("%d", opts.MaxHistory)},
+							},
+							LivenessProbe: &v1.Probe{
+								Handler: v1.Handler{
+									HTTPGet: &v1.HTTPGetAction{
+										Path: "/liveness",
+										Port: intstr.FromInt(44135),
+									},
+								},
+								InitialDelaySeconds: 1,
+								TimeoutSeconds:      1,
+							},
+							ReadinessProbe: &v1.Probe{
+								Handler: v1.Handler{
+									HTTPGet: &v1.HTTPGetAction{
+										Path: "/readiness",
+										Port: intstr.FromInt(44135),
+									},
+								},
+								InitialDelaySeconds: 1,
+								TimeoutSeconds:      1,
+							},
+						},
+					},
+					HostNetwork: opts.EnableHostNetwork,
+					NodeSelector: map[string]string{
+						"beta.kubernetes.io/os": "linux",
+					},
+				},
+			},
+		},
+	}
+
+	if opts.tls() {
+		const certsDir = "/etc/certs"
+
+		var tlsVerify, tlsEnable = "", "1"
+		if opts.VerifyTLS {
+			tlsVerify = "1"
+		}
+
+		// Mount secret to "/etc/certs"
+		d.Spec.Template.Spec.Containers[0].VolumeMounts = append(d.Spec.Template.Spec.Containers[0].VolumeMounts, v1.VolumeMount{
+			Name:      "tiller-certs",
+			ReadOnly:  true,
+			MountPath: certsDir,
+		})
+		// Add environment variable required for enabling TLS
+		d.Spec.Template.Spec.Containers[0].Env = append(d.Spec.Template.Spec.Containers[0].Env, []v1.EnvVar{
+			{Name: "TILLER_TLS_VERIFY", Value: tlsVerify},
+			{Name: "TILLER_TLS_ENABLE", Value: tlsEnable},
+			{Name: "TILLER_TLS_CERTS", Value: certsDir},
+		}...)
+		// Add secret volume to deployment
+		d.Spec.Template.Spec.Volumes = append(d.Spec.Template.Spec.Volumes, v1.Volume{
+			Name: "tiller-certs",
+			VolumeSource: v1.VolumeSource{
+				Secret: &v1.SecretVolumeSource{
+					SecretName: "tiller-secret",
+				},
+			},
+		})
+	}
+	return d
+}
+
+func generateDaemonSet(opts *Options) *v1beta1.DaemonSet {
+	labels := generateLabels(map[string]string{"name": "tiller"})
+	d := &v1beta1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: opts.Namespace,
+			Name:      deploymentName,
+			Labels:    labels,
+		},
+		Spec: v1beta1.DaemonSetSpec{
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: labels,
